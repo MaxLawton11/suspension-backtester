@@ -4,8 +4,6 @@ import time
 import pandas as pd
 import streamlit as st
 
-# streamlit run app.py --server.port 8001 --server.address 0.0.0.0
-
 
 # -----------------------------------------------------------------------------
 # Core configuration for this app.
@@ -102,12 +100,19 @@ def ensure_state() -> None:
         init_setpoints_from_sensor_log(st.session_state["sensor_log_df"]),
     )
     st.session_state.setdefault("current_time", 0)
+    # Mirror key for the interactive timeline slider widget.
+    st.session_state.setdefault("timeline_slider", 0)
     st.session_state.setdefault("max_time", 0)
     st.session_state.setdefault("play", False)
     # Playback speed in timeline ticks per second.
     st.session_state.setdefault("ticks_per_second", 5.0)
     # last_tick can be useful for future non-blocking play logic.
     st.session_state.setdefault("last_tick", time.time())
+    # Auto-apply code once on first load and whenever code text changes.
+    st.session_state.setdefault("code_needs_auto_apply", True)
+    st.session_state.setdefault("last_auto_applied_code_text", None)
+    st.session_state.setdefault("last_auto_applied_log_name", None)
+    st.session_state.setdefault("auto_apply_error", None)
     # Starter code shown in the code editor tab.
     st.session_state.setdefault("code_text", """shock = max(0.0, min(100.0, get_sensor('ThrottlePct')))
 set_each(
@@ -122,6 +127,50 @@ set_each(
 def clamp_time(value: int, max_time: int) -> int:
     # Clamp any user/app timeline movement into valid slider bounds.
     return max(0, min(int(value), int(max_time)))
+
+
+def sync_timeline_time(value: int) -> None:
+    # Canonical timeline state lives in current_time.
+    clamped = clamp_time(value, st.session_state["max_time"])
+    st.session_state["current_time"] = clamped
+
+
+def handle_reset() -> None:
+    st.session_state["play"] = False
+    sync_timeline_time(0)
+
+
+def handle_backstep() -> None:
+    st.session_state["play"] = False
+    sync_timeline_time(st.session_state["current_time"] - 1)
+
+
+def handle_frontstep() -> None:
+    st.session_state["play"] = False
+    sync_timeline_time(st.session_state["current_time"] + 1)
+
+
+def handle_toggle_play() -> None:
+    next_play_state = not st.session_state["play"]
+    st.session_state["play"] = next_play_state
+
+    if next_play_state:
+        # If play is pressed at the end, restart from the beginning.
+        if st.session_state["current_time"] >= st.session_state["max_time"]:
+            sync_timeline_time(0)
+        st.session_state["last_tick"] = time.time()
+
+
+def handle_timeline_slider_change() -> None:
+    # Slider only controls time while paused.
+    if st.session_state["play"]:
+        return
+    sync_timeline_time(int(st.session_state["timeline_slider"]))
+
+
+def handle_code_text_change() -> None:
+    # Apply logic after user stops editing (widget change event).
+    st.session_state["code_needs_auto_apply"] = True
 
 
 def get_row_at_time(df: pd.DataFrame, current_time: int) -> pd.Series:
@@ -166,7 +215,7 @@ def execute_user_code(
     # Execute user-authored setpoint code in a constrained runtime.
     #
     # Inputs available to user code:
-    # - set(value): assign same value to all 4 corners at current time
+    # - set_all(value): assign same value to all 4 corners at current time
     # - set_each(...): assign per-corner values
     # - get_sensor(name): read a sensor value at current time
     # - time: current timeline tick
@@ -275,7 +324,7 @@ def execute_user_code(
 
         # Scope exposed to user code.
         runtime_scope = {
-            "set": set_all,
+            "set_all": set_all,
             "set_each": set_each,
             "get_sensor": get_sensor,
             "time": TickValue(int(tick)),
@@ -365,7 +414,7 @@ if st.session_state["selected_log"] not in log_options and log_options:
     st.session_state["selected_log"] = log_options[0]
 
 with st.container():
-    log_col, timing_col, download_col, logo_col = st.columns([1.5, 3, 1, 2])
+    log_col, timing_col, download_col, logo_col = st.columns([2, 3, 1, 2])
 
     with log_col:
         # Left-side controls for selecting/opening input logs.
@@ -395,6 +444,8 @@ with st.container():
                     st.session_state["processed_setpoints_df"] = init_setpoints_from_sensor_log(loaded_sensor_df)
                     st.session_state["max_time"] = int(loaded_sensor_df["Time"].max()) if not loaded_sensor_df.empty else 0
                     st.session_state["current_time"] = clamp_time(st.session_state["current_time"], st.session_state["max_time"])
+                    st.session_state["timeline_slider"] = st.session_state["current_time"]
+                    st.session_state["code_needs_auto_apply"] = True
                     st.session_state["loaded_log_name"] = st.session_state["selected_log"]
 
         with log_col_link:
@@ -413,17 +464,41 @@ with st.container():
         )
 
         with timing_col_reset:
-            reset = st.button("🔃", help="Reset timeline", use_container_width=True)
+            st.button(
+                "🔃",
+                help="Reset timeline",
+                use_container_width=True,
+                on_click=handle_reset,
+                key="timeline_reset_btn",
+            )
 
         with timing_col_backstep:
-            backstep = st.button("⬅️", help="Step back", use_container_width=True)
+            st.button(
+                "⬅️",
+                help="Step back",
+                use_container_width=True,
+                on_click=handle_backstep,
+                key="timeline_backstep_btn",
+            )
 
         with timing_col_play:
             play_label = "⏸️" if st.session_state["play"] else "▶️"
-            toggle_play = st.button(play_label, help="Play/Pause", use_container_width=True)
+            st.button(
+                play_label,
+                help="Play/Pause",
+                use_container_width=True,
+                on_click=handle_toggle_play,
+                key="timeline_play_btn",
+            )
 
         with timing_col_frontstep:
-            frontstep = st.button("➡️", help="Step forward", use_container_width=True)
+            st.button(
+                "➡️",
+                help="Step forward",
+                use_container_width=True,
+                on_click=handle_frontstep,
+                key="timeline_frontstep_btn",
+            )
 
         with timing_col_speed:
             # Keep speed label + control on one tight horizontal line on the right.
@@ -435,8 +510,8 @@ with st.container():
             with speed_slider_col:
                 speed_value = st.slider(
                     "Ticks/sec",
-                    min_value=0.1,
-                    max_value=30.0,
+                    min_value=1.0,
+                    max_value=10.0,
                     value=(st.session_state["ticks_per_second"]),
                     step=1.0,
                     label_visibility="collapsed",
@@ -444,46 +519,22 @@ with st.container():
                 )
             st.session_state["ticks_per_second"] = float(speed_value)
 
-        if reset:
-            # Reset always returns to the first tick and pauses playback.
-            st.session_state["play"] = False
-            st.session_state["current_time"] = 0
-
-        if backstep:
-            # Manual stepping pauses playback to prevent competing timeline updates.
-            st.session_state["play"] = False
-            st.session_state["current_time"] = clamp_time(
-                st.session_state["current_time"] - 1,
-                st.session_state["max_time"],
-            )
-
-        if frontstep:
-            # Manual stepping pauses playback to prevent competing timeline updates.
-            st.session_state["play"] = False
-            st.session_state["current_time"] = clamp_time(
-                st.session_state["current_time"] + 1,
-                st.session_state["max_time"],
-            )
-
-        if toggle_play:
-            # Toggle playback mode.
-            st.session_state["play"] = not st.session_state["play"]
-            st.session_state["last_tick"] = time.time()
-
         # Primary timeline slider.
         # Disabled during playback so only one source controls time movement.
-        slider_time = st.slider(
+        # IMPORTANT: update widget state before instantiation in this run.
+        if st.session_state.get("timeline_slider") != st.session_state["current_time"]:
+            st.session_state["timeline_slider"] = st.session_state["current_time"]
+
+        st.slider(
             "Timeline",
             0,
             st.session_state["max_time"],
-            st.session_state["current_time"],
+            key="timeline_slider",
             label_visibility="collapsed",
             width="stretch",
             disabled=st.session_state["play"],
+            on_change=handle_timeline_slider_change,
         )
-        if slider_time != st.session_state["current_time"] and not st.session_state["play"]:
-            # Sync slider movement back into session state.
-            st.session_state["current_time"] = slider_time
 
     with download_col:
         # Quick run stats.
@@ -536,6 +587,7 @@ with st.container():
             code_text = st.text_area(
                 "Code Area",
                 key="code_text",
+                on_change=handle_code_text_change,
                 label_visibility="collapsed",
                 height=200,
                 placeholder="""shock = max(0.0, min(100.0, get_sensor('ThrottlePct')))
@@ -556,6 +608,16 @@ set_each(
                 processed_setpoints_df,
             )
 
+            if st.session_state.get("code_needs_auto_apply", False):
+                if prepared_error:
+                    st.session_state["auto_apply_error"] = prepared_error
+                else:
+                    st.session_state["processed_setpoints_df"] = prepared_df
+                    st.session_state["auto_apply_error"] = None
+                    st.session_state["last_auto_applied_code_text"] = st.session_state["code_text"]
+                    st.session_state["last_auto_applied_log_name"] = st.session_state.get("selected_log")
+                st.session_state["code_needs_auto_apply"] = False
+
             # Keep Apply and Save on the same row.
             apply_col, save_col = st.columns(2)
 
@@ -566,6 +628,9 @@ set_each(
                         st.error(f"Code error: {prepared_error}")
                     else:
                         st.session_state["processed_setpoints_df"] = prepared_df
+                        st.session_state["auto_apply_error"] = None
+                        st.session_state["last_auto_applied_code_text"] = st.session_state["code_text"]
+                        st.session_state["last_auto_applied_log_name"] = st.session_state.get("selected_log")
                         st.success("Applied code across all times")
 
             with save_col:
@@ -581,10 +646,16 @@ set_each(
 
                 if save_clicked and not prepared_error:
                     st.session_state["processed_setpoints_df"] = prepared_df
+                    st.session_state["auto_apply_error"] = None
+                    st.session_state["last_auto_applied_code_text"] = st.session_state["code_text"]
+                    st.session_state["last_auto_applied_log_name"] = st.session_state.get("selected_log")
                     st.success("Applied code across all times and downloaded CSV")
 
             if prepared_error:
                 st.caption(f"Save disabled until code is valid. Latest error: {prepared_error}")
+
+            if st.session_state.get("auto_apply_error"):
+                st.caption(f"Auto-apply paused due to code error: {st.session_state['auto_apply_error']}")
 
             st.caption("See the Docs tab for available functions and example scripts.")
 
@@ -602,11 +673,11 @@ set_each(
 
             st.markdown("### Function reference")
 
-            st.markdown("#### set(value)")
+            st.markdown("#### set_all(value)")
             st.markdown("- Inputs: `value` (float-like)")
             st.markdown("- Output: none")
             st.markdown("- Explanation: Sets FL, FR, BL, and BR to the same value for the current tick.")
-            st.code("set(0.8)", language="python")
+            st.code("set_all(0.8)", language="python")
 
             st.markdown("#### set_each(fl=None, fr=None, bl=None, br=None)")
             st.markdown("- Inputs: optional float-like values for each corner")
@@ -644,13 +715,13 @@ set_each(
             st.markdown("- Inputs: numeric value, optional precision")
             st.markdown("- Output: numeric value")
             st.markdown("- Explanation: Rounds computed values before applying them.")
-            st.code("set(round(0.6 + get_sensor('ThrottlePct', 0.0) * 0.4, 3))", language="python")
+            st.code("set_all(round(0.6 + get_sensor('ThrottlePct', 0.0) * 0.4, 3))", language="python")
 
             st.markdown("#### float(x), int(x)")
             st.markdown("- Inputs: value convertible to number")
             st.markdown("- Output: converted number")
             st.markdown("- Explanation: Explicit numeric conversion when needed.")
-            st.code("raw = get_sensor('ShockFL', 67.0)\nset(float(raw) / 100.0)", language="python")
+            st.code("raw = get_sensor('ShockFL', 67.0)\nset_all(float(raw) / 100.0)", language="python")
 
             st.markdown("### Runtime variables")
             st.code(
@@ -692,19 +763,19 @@ sensor
             st.markdown("### Example scripts")
             st.code(
                 """# 1) Constant setpoint everywhere
-set(0.8)
+set_all(0.8)
 
 # 2) Corner-specific static values
 set_each(fl=0.92, fr=0.92, bl=0.78, br=0.78)
 
 # 3) Direct throttle mapping
 throttle = get_sensor('ThrottlePct', 0.0)
-set(0.5 + 0.5 * throttle)
+set_all(0.5 + 0.5 * throttle)
 
 # 4) Clamp with min/max to keep values in bounds
 throttle = get_sensor('ThrottlePct', 0.0)
 target = min(1.0, max(0.0, 0.35 + throttle * 0.9))
-set(target)
+set_all(target)
 
 # 5) Brake-biased front loading
 brake = get_sensor('BrakePct', 0.0)
@@ -723,14 +794,14 @@ set_each(fl=base + split, bl=base + split, fr=base - split, br=base - split)
 
 # 7) Use time as a value
 phase = (time % 40) / 40.0
-set(0.7 + 0.2 * phase)
+set_all(0.7 + 0.2 * phase)
 
 # 8) Use time() as a function (supported)
 t = time()
 if t < 100:
-    set(0.75)
+    set_all(0.75)
 else:
-    set(0.85)
+    set_all(0.85)
 
 # 9) Mixed sensor fusion example
 throttle = get_sensor('ThrottlePct', 0.0)
@@ -747,7 +818,7 @@ set_each(
 
 # 10) Minimal safe fallback style
 value = get_sensor('SomeMissingSensor', 0.8)
-set(min(1.0, max(0.0, value)))
+set_all(min(1.0, max(0.0, value)))
 """,
                 language="python",
             )
@@ -761,7 +832,7 @@ import math
 f = open('out.txt', 'w')
 
 # Not allowed: unavailable builtins
-set(sum([0.1, 0.2, 0.3]))
+set_all(sum([0.1, 0.2, 0.3]))
 
 # Not allowed: app globals
 print(st.session_state)
@@ -824,10 +895,7 @@ if st.session_state["play"]:
     # Keep playback moving at configured ticks-per-second while preserving user controls.
     ticks_per_second = max(float(st.session_state.get("ticks_per_second", 1.0)), 0.1)
     time.sleep(1.0 / ticks_per_second)
-    st.session_state["current_time"] = clamp_time(
-        st.session_state["current_time"] + 1,
-        st.session_state["max_time"],
-    )
+    sync_timeline_time(st.session_state["current_time"] + 1)
     if st.session_state["current_time"] >= st.session_state["max_time"]:
         st.session_state["play"] = False
     st.rerun()
