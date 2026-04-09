@@ -4,8 +4,7 @@
 
 # how to run:
 # 1) pip install streamlit pandas
-# 2) place CSV logs in ./logs relative to this file
-# 3) streamlit run app.py
+# 2) streamlit run app.py
 
 
 
